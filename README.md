@@ -1,3 +1,8 @@
+<div align=center>
+
+<img src="extras/banner.png" alt="Banner" width="30%">
+
+</div>
 <h1 align=center>Chaos Rings III — Nintendo Switch port</h1>
 
 This is a wrapper/port of the Android version of *Chaos Rings III*
@@ -54,13 +59,6 @@ virtual cursor and **A** taps. **B** / **+** map to the Android *Back* key
 * `language` — `0` follows the Switch system language; otherwise
   `1` ja, `2` en.
 
-### Known limitations
-
-* **FMV movies are skipped.** The Media.Vision movie container inside
-  `CRDBmov.android.mvgl` is not decoded yet; `local.mediav.MoviePlayer` reports
-  every movie as finished so the engine advances past the cutscene. (See
-  `source/movie_player.c` — this is the natural place to add an ffmpeg decoder.)
-
 ### How to build
 
 You're going to need devkitA64 and the following devkitPro packages:
@@ -76,6 +74,12 @@ You're going to need devkitA64 and the following devkitPro packages:
 * fgsfds for [max_nx](https://github.com/fgsfdsfgs/max_nx), which this loader is
   based on
 * TheOfficialFloW for the original Vita ports that pioneered this technique
+
+### Support
+
+If you enjoy my work and want to support me :
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/D1D1P2MOG)
 
 ### Legal
 
