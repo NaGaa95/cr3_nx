@@ -228,7 +228,17 @@ static void update_input(void) {
   else
     vf_set(3, 0, 0, 0);
 
-  vf_emit(AMOTION_ACTION_MOVE);
+  static u64 last_move_tick = 0;
+  const u64 now = armGetSystemTick();
+  if (g_nslots > 0) {
+    if (!last_move_tick ||
+        armTicksToNs(now - last_move_tick) >= 16666667ull) {
+      vf_emit(AMOTION_ACTION_MOVE);
+      last_move_tick = now;
+    }
+  } else {
+    last_move_tick = 0;
+  }
 
   // --- B / + map to the Android BACK key (cancel / menu back) ---
   if ((down & HidNpadButton_B) || (down & HidNpadButton_Plus)) {

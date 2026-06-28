@@ -243,6 +243,18 @@ static void *get_classloader_obj(void) {
 static FakeID id_pool[MAX_IDS];
 static int id_count = 0;
 
+static void copy_trunc(char *dst, size_t dstsz, const char *src) {
+  if (!dst || dstsz == 0)
+    return;
+  if (!src)
+    src = "";
+  size_t n = strlen(src);
+  if (n >= dstsz)
+    n = dstsz - 1;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
 static FakeID *get_id(const char *cls, const char *name, const char *sig) {
   for (int i = 0; i < id_count; i++)
     if (!strcmp(id_pool[i].name, name) && !strcmp(id_pool[i].sig, sig) &&
@@ -254,9 +266,9 @@ static FakeID *get_id(const char *cls, const char *name, const char *sig) {
   }
   FakeID *id = &id_pool[id_count++];
   id->tag = TAG_ID;
-  strncpy(id->cls, cls ? cls : "", sizeof(id->cls) - 1);
-  strncpy(id->name, name, sizeof(id->name) - 1);
-  strncpy(id->sig, sig, sizeof(id->sig) - 1);
+  copy_trunc(id->cls, sizeof(id->cls), cls);
+  copy_trunc(id->name, sizeof(id->name), name);
+  copy_trunc(id->sig, sizeof(id->sig), sig);
   return id;
 }
 

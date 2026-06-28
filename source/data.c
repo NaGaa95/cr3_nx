@@ -78,6 +78,18 @@ static const char *base_name(const char *p) {
   return s ? s + 1 : p;
 }
 
+static void copy_trunc(char *dst, size_t dstsz, const char *src) {
+  if (!dst || dstsz == 0)
+    return;
+  if (!src)
+    src = "";
+  size_t n = strlen(src);
+  if (n >= dstsz)
+    n = dstsz - 1;
+  memcpy(dst, src, n);
+  dst[n] = '\0';
+}
+
 void *AAssetManager_fromJava(void *env, void *assetManager) {
   (void)env; (void)assetManager;
   return (void *)1; // any non-NULL token; we ignore the manager
@@ -131,24 +143,53 @@ static int asset_load(Asset *a) {
   if (a->mem) return 1;
 
   FILE *f = fopen(a->path, "rb");
-  if (!f) { debugPrintf("AAsset: fopen(%s) FAIL\n", a->path); return 0; }
+  if (!f) {
+    debugPrintf("AAsset: fopen(%s) FAIL\n", a->path);
+    return 0;
+  }
   uint8_t *mem = malloc(a->size ? a->size : 1);
-  if (!mem) { fclose(f); debugPrintf("AAsset: OOM %lu for %s\n", (unsigned long)a->size, a->path); return 0; }
+  if (!mem) {
+    fclose(f);
+    debugPrintf("AAsset: OOM %lu for %s\n", (unsigned long)a->size, a->path);
+    return 0;
+  }
   const size_t got = a->size ? fread(mem, 1, a->size, f) : 0;
   fclose(f);
-  if (got != a->size) { free(mem); debugPrintf("AAsset: short read %lu/%lu %s\n", (unsigned long)got, (unsigned long)a->size, a->path); return 0; }
+  if (got != a->size) {
+    free(mem);
+    debugPrintf("AAsset: short read %lu/%lu %s\n", (unsigned long)got, (unsigned long)a->size, a->path);
+    return 0;
+  }
 
+  uint8_t *duplicate = NULL;
   if (a->size >= ACACHE_MIN) {
     mutexLock(&g_acache_lock);
-    for (int i = 0; i < ACACHE_N; i++)
-      if (!g_acache[i].mem) {
-        strncpy(g_acache[i].key, key, sizeof(g_acache[i].key) - 1);
-        g_acache[i].mem = mem; g_acache[i].size = a->size; a->cached = 1;
+    for (int i = 0; i < ACACHE_N; i++) {
+      if (g_acache[i].mem && !strcmp(g_acache[i].key, key)) {
+        duplicate = g_acache[i].mem;
         break;
       }
+    }
+    if (!duplicate) {
+      for (int i = 0; i < ACACHE_N; i++) {
+        if (!g_acache[i].mem) {
+          copy_trunc(g_acache[i].key, sizeof(g_acache[i].key), key);
+          g_acache[i].mem = mem;
+          g_acache[i].size = a->size;
+          a->cached = 1;
+          break;
+        }
+      }
+    }
     mutexUnlock(&g_acache_lock);
   }
-  a->mem = mem;
+  if (duplicate) {
+    free(mem);
+    a->mem = duplicate;
+    a->cached = 1;
+  } else {
+    a->mem = mem;
+  }
   return 1;
 }
 

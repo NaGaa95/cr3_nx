@@ -192,6 +192,8 @@ typedef struct {
 
 #define MAX_PLAYERS 64
 #define BQ_SLOTS 8
+#define DRY_DEACTIVATE_CALLBACKS 40
+#define DRY_REUSE_CALLBACKS 4
 
 typedef struct {
   const void *data;
@@ -269,16 +271,14 @@ static float mb_to_linear(SLmillibel mb) {
 // otherwise the engine's mixer thread (holding its own mutex, calling Enqueue
 // which wants our lock) deadlocks against us.
 static void mix_player(Player *p, int32_t *acc, int frames) {
-  if (!p->playing)
-    return;
-
-  // A playing player with nothing queued is a finished one-shot SE the engine
-  // fired and never Destroy'd; count the dry callbacks so alloc can recycle it.
   SDL_LockMutex(p->lock);
+  const int playing = p->playing;
   const int dry = (!p->cur) && (p->q_head == p->q_tail);
   SDL_UnlockMutex(p->lock);
   if (dry) { if (p->drained < (1 << 20)) p->drained++; return; }
   p->drained = 0;
+  if (!playing)
+    return;
 
   const float g = p->gain;
   const int stereo = (p->channels >= 2);
@@ -357,6 +357,75 @@ static void mix_movie(int32_t *acc, int frames) {
   SDL_UnlockMutex(g_movie_lock);
 }
 
+static int player_deactivate_slot_locked(int slot) {
+  if (slot < 0 || slot >= g_player_count)
+    return 0;
+  Player *p = g_players[slot];
+  if (!p)
+    return 0;
+  SDL_LockMutex(p->lock);
+  const int dry = (!p->cur) && (p->q_head == p->q_tail);
+  if (!dry) {
+    p->drained = 0;
+    SDL_UnlockMutex(p->lock);
+    return 0;
+  }
+  p->in_use = 0;
+  g_players[slot] = NULL;
+  SDL_UnlockMutex(p->lock);
+  return 1;
+}
+
+static int player_register_locked(Player *p, int dry_threshold) {
+  if (!p)
+    return 0;
+  if (p->in_use)
+    return 1;
+
+  int slot = -1;
+  for (int i = 0; i < g_player_count; i++)
+    if (g_players[i] == NULL) { slot = i; break; }
+
+  if (slot < 0 && g_player_count < MAX_PLAYERS)
+    slot = g_player_count++;
+
+  while (slot < 0) {
+    int victim = -1;
+    int best_drained = dry_threshold;
+    for (int i = 0; i < g_player_count; i++) {
+      Player *q = g_players[i];
+      if (q && q->drained > best_drained) {
+        victim = i;
+        best_drained = q->drained;
+      }
+    }
+    if (victim < 0)
+      break;
+    if (player_deactivate_slot_locked(victim))
+      slot = victim;
+  }
+
+  if (slot < 0)
+    return 0;
+
+  p->in_use = 1;
+  p->drained = 0;
+  g_players[slot] = p;
+  return 1;
+}
+
+static int player_register(Player *p, int dry_threshold) {
+  int ok;
+  if (!g_reg_lock)
+    g_reg_lock = SDL_CreateMutex();
+  if (!g_reg_lock)
+    return 0;
+  SDL_LockMutex(g_reg_lock);
+  ok = player_register_locked(p, dry_threshold);
+  SDL_UnlockMutex(g_reg_lock);
+  return ok;
+}
+
 static void SDLCALL audio_callback(void *ud, Uint8 *stream, int len) {
   (void)ud;
 
@@ -368,13 +437,21 @@ static void SDLCALL audio_callback(void *ud, Uint8 *stream, int len) {
 
   const int frames = len / 4; // S16 stereo
   static int32_t acc[8192 * 2];
-  if (frames > 8192) { memset(stream, 0, len); return; }
+  if (frames > 8192) {
+    memset(stream, 0, len);
+    return;
+  }
   memset(acc, 0, frames * 2 * sizeof(int32_t));
 
   SDL_LockMutex(g_reg_lock);
-  for (int i = 0; i < g_player_count; i++)
-    if (g_players[i] && g_players[i]->in_use)
-      mix_player(g_players[i], acc, frames);
+  for (int i = 0; i < g_player_count; i++) {
+    Player *p = g_players[i];
+    if (p && p->in_use) {
+      mix_player(p, acc, frames);
+      if (p->drained > DRY_DEACTIVATE_CALLBACKS)
+        player_deactivate_slot_locked(i);
+    }
+  }
   SDL_UnlockMutex(g_reg_lock);
 
   mix_movie(acc, frames);
@@ -525,7 +602,15 @@ void opensles_movie_end(void) {
 
 static SLresult bq_Enqueue(void *self, const void *pBuffer, SLuint32 size) {
   Player *p = CONTAINER(self, Player, bq_vt);
+  if (!p->in_use && !player_register(p, DRY_REUSE_CALLBACKS))
+    return SL_RESULT_PARAMETER_INVALID;
   SDL_LockMutex(p->lock);
+  if (!p->in_use) {
+    SDL_UnlockMutex(p->lock);
+    if (!player_register(p, DRY_REUSE_CALLBACKS))
+      return SL_RESULT_PARAMETER_INVALID;
+    SDL_LockMutex(p->lock);
+  }
   const int next = (p->q_tail + 1) % BQ_SLOTS;
   if (next == p->q_head) { // full
     SDL_UnlockMutex(p->lock);
@@ -578,6 +663,8 @@ static const SLBufferQueueItf_ bq_vtable = {
 
 static SLresult play_SetPlayState(void *self, SLuint32 state) {
   Player *p = CONTAINER(self, Player, play_vt);
+  if (state == SL_PLAYSTATE_PLAYING && !p->in_use && !player_register(p, DRY_REUSE_CALLBACKS))
+    return SL_RESULT_PARAMETER_INVALID;
   SDL_LockMutex(p->lock);
   p->playing = (state == SL_PLAYSTATE_PLAYING);
   SDL_UnlockMutex(p->lock);
@@ -640,7 +727,10 @@ static SLresult rate_GetProps(void *self, SLuint32 *p) { (void)self; if (p) *p =
 static SLresult rate_GetCaps(void *self, SLuint32 *p) { (void)self; if (p) *p = 0; return SL_RESULT_SUCCESS; }
 static SLresult rate_GetRange(void *self, SLuint8 i, SLint16 *min, SLint16 *max, SLint16 *step, SLuint32 *prop) {
   (void)self; (void)i;
-  if (min) *min = 500; if (max) *max = 2000; if (step) *step = 1; if (prop) *prop = 0;
+  if (min) *min = 500;
+  if (max) *max = 2000;
+  if (step) *step = 1;
+  if (prop) *prop = 0;
   return SL_RESULT_SUCCESS;
 }
 static const SLPlaybackRateItf_ rate_vtable = {
@@ -742,11 +832,14 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
   p->vol_vt = &vol_vtable;
   p->rate_vt = &rate_vtable;
   p->config_vt = &cfg_vtable;
-  p->in_use = 1;
   p->gain = 1.0f;
   p->channels = 2;
   p->rate = 44100;
   p->lock = SDL_CreateMutex();
+  if (!p->lock) {
+    free(p);
+    return SL_RESULT_PARAMETER_INVALID;
+  }
 
   if (src && src->pFormat) {
     const SLDataFormat_PCM *fmt = src->pFormat;
@@ -758,31 +851,12 @@ static SLresult eng_CreateAudioPlayer(void *self, SLObjectItf *pPlayer, SLDataSo
 
   ensure_device(p->rate);
 
-  SDL_LockMutex(g_reg_lock);
-  int slot = -1;
-  for (int i = 0; i < g_player_count; i++)
-    if (g_players[i] == NULL) { slot = i; break; }
-  if (slot < 0 && g_player_count < MAX_PLAYERS)
-    slot = g_player_count++;
-  if (slot < 0) {
-    // pool full: the engine never Destroys finished SEs, so reclaim one that has
-    // been playing-but-silent for >~0.8s (a live BGM re-enqueues far sooner, so
-    // it never becomes a victim). Safe to free here -- the mixer holds g_reg_lock
-    // while mixing, so it can't touch the victim concurrently.
-    for (int i = 0; i < g_player_count; i++) {
-      Player *q = g_players[i];
-      if (q && q->playing && q->drained > 40) {
-        g_players[i] = NULL;
-        if (q->lock) SDL_DestroyMutex(q->lock);
-        free(q);
-        slot = i;
-        break;
-      }
-    }
+  if (!player_register(p, DRY_REUSE_CALLBACKS)) {
+    if (p->lock) SDL_DestroyMutex(p->lock);
+    free(p);
+    *pPlayer = NULL;
+    return SL_RESULT_PARAMETER_INVALID;
   }
-  if (slot >= 0)
-    g_players[slot] = p;
-  SDL_UnlockMutex(g_reg_lock);
 
   *pPlayer = &p->obj_vt;
   return SL_RESULT_SUCCESS;

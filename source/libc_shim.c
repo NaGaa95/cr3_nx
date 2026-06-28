@@ -330,16 +330,17 @@ int posix_memalign_fake(void **out, size_t align, size_t size) {
 #define MMAP_SLOTS 256
 static struct { void *p; size_t n; } g_mmaps[MMAP_SLOTS];
 static Mutex g_mmap_lock;
-static int g_mmap_init = 0;
 
 #define BIONIC_MAP_ANONYMOUS 0x20
 
 void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long offset) {
   (void)addr; (void)prot;
-  if (!g_mmap_init) { mutexInit(&g_mmap_lock); g_mmap_init = 1; }
   if (length == 0) length = 1;
   void *p = memalign(0x1000, length);
-  if (!p) { errno = ENOMEM; return (void *)-1; }
+  if (!p) {
+    errno = ENOMEM;
+    return (void *)-1;
+  }
 
   if (flags & BIONIC_MAP_ANONYMOUS) {
     memset(p, 0, length);
@@ -364,8 +365,14 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
 
   int placed = 0;
   mutexLock(&g_mmap_lock);
-  for (int i = 0; i < MMAP_SLOTS; i++)
-    if (!g_mmaps[i].p) { g_mmaps[i].p = p; g_mmaps[i].n = length; placed = 1; break; }
+  for (int i = 0; i < MMAP_SLOTS; i++) {
+    if (!g_mmaps[i].p) {
+      g_mmaps[i].p = p;
+      g_mmaps[i].n = length;
+      placed = 1;
+      break;
+    }
+  }
   mutexUnlock(&g_mmap_lock);
   if (!placed) { free(p); errno = ENOMEM; return (void *)-1; } // registry full
   return p;
@@ -373,11 +380,22 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
 
 int munmap_fake(void *addr, size_t length) {
   (void)length;
-  if (!g_mmap_init) return 0;
+  int found = 0;
   mutexLock(&g_mmap_lock);
-  for (int i = 0; i < MMAP_SLOTS; i++)
-    if (g_mmaps[i].p == addr) { free(addr); g_mmaps[i].p = NULL; g_mmaps[i].n = 0; break; }
+  for (int i = 0; i < MMAP_SLOTS; i++) {
+    if (g_mmaps[i].p == addr) {
+      free(addr);
+      g_mmaps[i].p = NULL;
+      g_mmaps[i].n = 0;
+      found = 1;
+      break;
+    }
+  }
   mutexUnlock(&g_mmap_lock);
+  if (!found) {
+    errno = EINVAL;
+    return -1;
+  }
   return 0;
 }
 int mprotect_fake(void *addr, size_t len, int prot) { (void)addr; (void)len; (void)prot; return 0; }

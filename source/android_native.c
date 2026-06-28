@@ -22,6 +22,7 @@
 
 #define AINPUT_EVENT_TYPE_KEY    1
 #define AINPUT_EVENT_TYPE_MOTION 2
+#define AMOTION_ACTION_MOVE      2
 
 // input event/queue types are defined up front so the fake-fd readability check
 // (fd_readable_locked) can read queue->count.
@@ -43,6 +44,8 @@ struct AInputQueue {
   AInputEvent *head, *tail;
   int count;
 };
+
+#define INPUT_QUEUE_SOFT_CAP 64
 
 // ===========================================================================
 // fake-fd layer: an in-process pipe + input-notifier backing for the glue's
@@ -166,6 +169,12 @@ typedef struct { int fd; int ident; int events; ALooper_callbackFunc cb; void *d
 struct ALooper { PollItem items[MAX_POLL_ITEMS]; int n; };
 static ALooper g_looper;
 
+static void poll_clear_outputs(int *outFd, int *outEvents, void **outData) {
+  if (outFd) *outFd = 0;
+  if (outEvents) *outEvents = 0;
+  if (outData) *outData = NULL;
+}
+
 ALooper *ALooper_prepare(int opts) {
   (void)opts;
   return &g_looper;
@@ -217,7 +226,7 @@ int ALooper_pollOnce(int timeoutMillis, int *outFd, int *outEvents, void **outDa
         mutexUnlock(&g_lock);
         const int keep = cb(fd, ev, d);
         if (!keep) ALooper_removeFd(&g_looper, fd);
-        if (outFd) *outFd = 0; if (outEvents) *outEvents = 0; if (outData) *outData = NULL;
+        poll_clear_outputs(outFd, outEvents, outData);
         return ALOOPER_POLL_CALLBACK;
       }
       if (outFd) *outFd = it->fd;
@@ -229,7 +238,7 @@ int ALooper_pollOnce(int timeoutMillis, int *outFd, int *outEvents, void **outDa
     }
     if (timeoutMillis == 0) {
       mutexUnlock(&g_lock);
-      if (outFd) *outFd = 0; if (outEvents) *outEvents = 0; if (outData) *outData = NULL;
+      poll_clear_outputs(outFd, outEvents, outData);
       return ALOOPER_POLL_TIMEOUT;
     }
     if (timeoutMillis < 0) {
@@ -238,13 +247,13 @@ int ALooper_pollOnce(int timeoutMillis, int *outFd, int *outEvents, void **outDa
       const u64 now = armGetSystemTick();
       if (now >= deadline) {
         mutexUnlock(&g_lock);
-        if (outFd) *outFd = 0; if (outEvents) *outEvents = 0; if (outData) *outData = NULL;
+        poll_clear_outputs(outFd, outEvents, outData);
         return ALOOPER_POLL_TIMEOUT;
       }
       const Result rc = condvarWaitTimeout(&g_cond, &g_lock, armTicksToNs(deadline - now));
       if (R_FAILED(rc)) { // timed out
         mutexUnlock(&g_lock);
-        if (outFd) *outFd = 0; if (outEvents) *outEvents = 0; if (outData) *outData = NULL;
+        poll_clear_outputs(outFd, outEvents, outData);
         return ALOOPER_POLL_TIMEOUT;
       }
     }
@@ -309,6 +318,27 @@ void AInputQueue_finishEvent(AInputQueue *queue, AInputEvent *event, int handled
 
 static void enqueue_event(AInputEvent *e) {
   mutexLock(&g_lock);
+
+  const int is_move = (e->type == AINPUT_EVENT_TYPE_MOTION &&
+                       (e->action & 0xff) == AMOTION_ACTION_MOVE);
+  if (is_move && g_queue.tail && g_queue.tail->type == AINPUT_EVENT_TYPE_MOTION &&
+      (g_queue.tail->action & 0xff) == AMOTION_ACTION_MOVE) {
+    AInputEvent *tail = g_queue.tail;
+    AInputEvent *next = tail->next;
+    *tail = *e;
+    tail->next = next;
+    free(e);
+    condvarWakeAll(&g_cond);
+    mutexUnlock(&g_lock);
+    return;
+  }
+
+  if (is_move && g_queue.count >= INPUT_QUEUE_SOFT_CAP) {
+    free(e);
+    mutexUnlock(&g_lock);
+    return;
+  }
+
   e->next = NULL;
   if (g_queue.tail) g_queue.tail->next = e; else g_queue.head = e;
   g_queue.tail = e;
@@ -417,7 +447,9 @@ void AConfiguration_delete(AConfiguration *c) { free(c); }
 static float g_orient[3] = { 0.0f, 0.0f, 9.81f };
 void android_set_orientation(float x, float y, float z) { g_orient[0] = x; g_orient[1] = y; g_orient[2] = z; }
 void android_get_orientation(float *x, float *y, float *z) {
-  if (x) *x = g_orient[0]; if (y) *y = g_orient[1]; if (z) *z = g_orient[2];
+  if (x) *x = g_orient[0];
+  if (y) *y = g_orient[1];
+  if (z) *z = g_orient[2];
 }
 
 int  ASensorEventQueue_enableSensor(void *q, const void *s)        { (void)q; (void)s; return 0; }

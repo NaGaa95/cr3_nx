@@ -166,41 +166,229 @@ int pthread_attr_init_fake(void *a) { if (a) { OurAttr *o = a; o->magic = ATTR_M
 int pthread_attr_destroy_fake(void *a) { (void)a; return 0; }
 int pthread_attr_setdetachstate_fake(void *a, int s) { if (a) { OurAttr *o = a; if (o->magic == ATTR_MAGIC) o->detach = (uint32_t)s; } return 0; }
 int pthread_attr_setstacksize_fake(void *a, size_t s) { if (a) { OurAttr *o = a; if (o->magic == ATTR_MAGIC) o->stacksize = s; } return 0; }
-int pthread_attr_getstacksize_fake(const void *a, size_t *s) { if (s) { const OurAttr *o = a; *s = (a && o->magic == ATTR_MAGIC && o->stacksize) ? o->stacksize : (512 * 1024); } return 0; }
+int pthread_attr_getstacksize_fake(const void *a, size_t *s) { if (s) { const OurAttr *o = a; *s = (a && o->magic == ATTR_MAGIC && o->stacksize) ? o->stacksize : (1024 * 1024); } return 0; }
 int pthread_attr_setschedparam_fake(void *a, const void *p) { (void)a; (void)p; return 0; }
 
-typedef struct { void *(*entry)(void *); void *arg; int is_main; } ThreadStart;
+#define BIONIC_THREAD_MAGIC 0x54485244u /* 'THRD' */
+#define ENGINE_MAIN_STACK   (2u * 1024u * 1024u)
+#define ENGINE_THREAD_STACK (1u * 1024u * 1024u)
+
+typedef struct BionicThread {
+  uint32_t magic;
+  pthread_t host;
+  pthread_mutex_t lock;
+  pthread_cond_t cond;
+  void *(*entry)(void *);
+  void *arg;
+  void *result;
+  int is_main;
+  int detached;
+  int done;
+  int joined;
+  struct BionicThread *reap_next;
+} BionicThread;
+
 static volatile int g_first_engine_thread_taken = 0;
-static void *thread_trampoline(void *p) {
-  ThreadStart ts = *(ThreadStart *)p;
-  free(p);
-  tls_setup_guard(); // engine code reads its stack-guard from tpidr_el0+0x28
-  void *r = ts.entry(ts.arg);
-  // the first engine thread is android_main(); when it returns the engine has
-  // quit, so flag the UI loop to tear down.
-  if (ts.is_main)
-    android_mark_main_finished();
-  return r;
+static pthread_key_t g_bionic_thread_key;
+static pthread_once_t g_bionic_thread_key_once = PTHREAD_ONCE_INIT;
+static pthread_once_t g_thread_reaper_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t g_thread_reaper_lock;
+static pthread_cond_t g_thread_reaper_cond;
+static pthread_t g_thread_reaper;
+static BionicThread *g_thread_reaper_head;
+static BionicThread *g_thread_reaper_tail;
+static int g_thread_reaper_ready;
+
+static void make_bionic_thread_key(void) {
+  pthread_key_create(&g_bionic_thread_key, NULL);
 }
+
+static void *thread_reaper_main(void *arg) {
+  (void)arg;
+  for (;;) {
+    pthread_mutex_lock(&g_thread_reaper_lock);
+    while (!g_thread_reaper_head)
+      pthread_cond_wait(&g_thread_reaper_cond, &g_thread_reaper_lock);
+    BionicThread *bt = g_thread_reaper_head;
+    g_thread_reaper_head = bt->reap_next;
+    if (!g_thread_reaper_head)
+      g_thread_reaper_tail = NULL;
+    pthread_mutex_unlock(&g_thread_reaper_lock);
+
+    pthread_join(bt->host, NULL);
+  }
+  return NULL;
+}
+
+static void start_thread_reaper(void) {
+  pthread_mutex_init(&g_thread_reaper_lock, NULL);
+  pthread_cond_init(&g_thread_reaper_cond, NULL);
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 128u * 1024u);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  if (pthread_create(&g_thread_reaper, &attr, thread_reaper_main, NULL) == 0)
+    g_thread_reaper_ready = 1;
+  pthread_attr_destroy(&attr);
+}
+
+static void queue_thread_for_reaping(BionicThread *bt) {
+  if (!g_thread_reaper_ready) {
+    pthread_detach(bt->host);
+    return;
+  }
+  bt->reap_next = NULL;
+  pthread_mutex_lock(&g_thread_reaper_lock);
+  if (g_thread_reaper_tail)
+    g_thread_reaper_tail->reap_next = bt;
+  else
+    g_thread_reaper_head = bt;
+  g_thread_reaper_tail = bt;
+  pthread_cond_signal(&g_thread_reaper_cond);
+  pthread_mutex_unlock(&g_thread_reaper_lock);
+}
+
+static BionicThread *current_bionic_thread(void) {
+  pthread_once(&g_bionic_thread_key_once, make_bionic_thread_key);
+  return pthread_getspecific(g_bionic_thread_key);
+}
+
+static BionicThread *as_bionic_thread(pthread_t thread) {
+  BionicThread *bt = (BionicThread *)thread;
+  return bt && bt->magic == BIONIC_THREAD_MAGIC ? bt : NULL;
+}
+
+static void finish_bionic_thread(void *arg) {
+  BionicThread *bt = arg;
+  pthread_mutex_lock(&bt->lock);
+  if (!bt->done) {
+    bt->done = 1;
+    pthread_cond_broadcast(&bt->cond);
+  }
+  pthread_mutex_unlock(&bt->lock);
+
+  if (bt->is_main)
+    android_mark_main_finished();
+  queue_thread_for_reaping(bt);
+}
+
+static void *thread_trampoline(void *p) {
+  BionicThread *bt = p;
+  tls_setup_guard(); // engine code reads its stack-guard from tpidr_el0+0x28
+  pthread_once(&g_bionic_thread_key_once, make_bionic_thread_key);
+  pthread_setspecific(g_bionic_thread_key, bt);
+
+  void *result = NULL;
+  pthread_cleanup_push(finish_bionic_thread, bt);
+  result = bt->entry(bt->arg);
+  pthread_mutex_lock(&bt->lock);
+  bt->result = result;
+  pthread_mutex_unlock(&bt->lock);
+  pthread_cleanup_pop(1);
+  return result;
+}
+
 int pthread_create_fake(pthread_t *thread, const void *bionic_attr, void *entry, void *arg) {
-  ThreadStart *ts = malloc(sizeof(*ts));
-  if (!ts) return -1;
-  ts->entry = (void *(*)(void *))entry;
-  ts->arg = arg;
-  ts->is_main = (__sync_lock_test_and_set(&g_first_engine_thread_taken, 1) == 0);
+  if (!thread || !entry)
+    return EINVAL;
+  pthread_once(&g_thread_reaper_once, start_thread_reaper);
+
+  BionicThread *bt = calloc(1, sizeof(*bt));
+  if (!bt) return EAGAIN;
+  bt->magic = BIONIC_THREAD_MAGIC;
+  bt->entry = (void *(*)(void *))entry;
+  bt->arg = arg;
+  bt->is_main = (__sync_lock_test_and_set(&g_first_engine_thread_taken, 1) == 0);
+  pthread_mutex_init(&bt->lock, NULL);
+  pthread_cond_init(&bt->cond, NULL);
+
   size_t stack = 0;
+  int detach = 0;
   if (bionic_attr) {
     const OurAttr *o = bionic_attr;
-    if (o->magic == ATTR_MAGIC) stack = o->stacksize;
+    if (o->magic == ATTR_MAGIC) {
+      stack = o->stacksize;
+      detach = o->detach;
+    }
   }
-  if (stack < (2u << 20)) stack = 2u << 20; // 2 MB floor for the heavy engine threads
+  if (bt->is_main) {
+    if (stack < ENGINE_MAIN_STACK)
+      stack = ENGINE_MAIN_STACK;
+  } else if (!stack) {
+    stack = ENGINE_THREAD_STACK;
+  }
+  bt->detached = detach != 0;
+
   pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, stack);
-  const int r = pthread_create(thread, &attr, thread_trampoline, ts);
+  if (stack)
+    pthread_attr_setstacksize(&attr, stack);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+
+  *thread = (pthread_t)bt;
+  const int r = pthread_create(&bt->host, &attr, thread_trampoline, bt);
   pthread_attr_destroy(&attr);
-  if (r != 0) { free(ts); return r; }
+  if (r != 0) {
+    *thread = NULL;
+    pthread_cond_destroy(&bt->cond);
+    pthread_mutex_destroy(&bt->lock);
+    bt->magic = 0;
+    free(bt);
+    return r;
+  }
   return 0;
 }
+
+int pthread_join_fake(pthread_t thread, void **result) {
+  BionicThread *bt = as_bionic_thread(thread);
+  if (!bt)
+    return pthread_join(thread, result);
+  if (bt == current_bionic_thread())
+    return EDEADLK;
+
+  pthread_mutex_lock(&bt->lock);
+  if (bt->detached || bt->joined) {
+    pthread_mutex_unlock(&bt->lock);
+    return EINVAL;
+  }
+  bt->joined = 1;
+  while (!bt->done)
+    pthread_cond_wait(&bt->cond, &bt->lock);
+  if (result)
+    *result = bt->result;
+  pthread_mutex_unlock(&bt->lock);
+  return 0;
+}
+
+int pthread_detach_fake(pthread_t thread) {
+  BionicThread *bt = as_bionic_thread(thread);
+  if (!bt)
+    return pthread_detach(thread);
+
+  pthread_mutex_lock(&bt->lock);
+  if (bt->detached || bt->joined) {
+    pthread_mutex_unlock(&bt->lock);
+    return EINVAL;
+  }
+  bt->detached = 1;
+  pthread_mutex_unlock(&bt->lock);
+  return 0;
+}
+
+void pthread_exit_fake(void *result) {
+  BionicThread *bt = current_bionic_thread();
+  if (bt) {
+    pthread_mutex_lock(&bt->lock);
+    bt->result = result;
+    pthread_mutex_unlock(&bt->lock);
+  }
+  pthread_exit(result);
+}
+
+pthread_t pthread_self_fake(void) {
+  BionicThread *bt = current_bionic_thread();
+  return bt ? (pthread_t)bt : pthread_self();
+}
+
 int pthread_setschedparam_fake(pthread_t t, int policy, const void *p) { (void)t; (void)policy; (void)p; return 0; }
 int pthread_sigmask_fake(int how, const void *set, void *old) { (void)how; (void)set; (void)old; return 0; }
 int pthread_kill_fake(pthread_t t, int sig) { (void)t; (void)sig; return 0; }
@@ -572,9 +760,9 @@ DynLibFunction dynlib_functions[] = {
   { "inet_ntoa", (uintptr_t)&inet_ntoa_stub },
 
   // --- pthread ---
-  { "pthread_create", (uintptr_t)&pthread_create_fake }, { "pthread_join", (uintptr_t)&pthread_join },
-  { "pthread_detach", (uintptr_t)&pthread_detach }, { "pthread_exit", (uintptr_t)&pthread_exit },
-  { "pthread_self", (uintptr_t)&pthread_self }, { "pthread_kill", (uintptr_t)&pthread_kill_fake },
+  { "pthread_create", (uintptr_t)&pthread_create_fake }, { "pthread_join", (uintptr_t)&pthread_join_fake },
+  { "pthread_detach", (uintptr_t)&pthread_detach_fake }, { "pthread_exit", (uintptr_t)&pthread_exit_fake },
+  { "pthread_self", (uintptr_t)&pthread_self_fake }, { "pthread_kill", (uintptr_t)&pthread_kill_fake },
   { "pthread_key_create", (uintptr_t)&pthread_key_create }, { "pthread_key_delete", (uintptr_t)&pthread_key_delete },
   { "pthread_getspecific", (uintptr_t)&pthread_getspecific }, { "pthread_setspecific", (uintptr_t)&pthread_setspecific },
   { "pthread_once", (uintptr_t)&pthread_once_fake },
